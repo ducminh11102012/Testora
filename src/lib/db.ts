@@ -1,20 +1,19 @@
 /**
  * Data layer.
  *
- * SQLite through Node's built-in `node:sqlite` driver: no native module to
- * compile and no database server to run. Every query in the product lives in
- * this file, which is what makes a later move to Postgres a contained change.
+ * PostgreSQL through the `pg` driver and a shared connection pool. Every query
+ * in the product lives in this file, keeping the persistence boundary contained.
  *
  * Tenancy: one database, every row that belongs to a customer carries `orgId`,
  * and every query that reads customer data takes an orgId. The public B2C
  * catalogue is itself an organisation (`kind = 'platform'`).
  *
- * Requires Node 22.5 or newer.
  */
 
-import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { Pool, type QueryResult, type QueryResultRow } from 'pg';
+// deasync keeps the existing synchronous data-layer contract used by server components.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const deasync = require('deasync') as { loopWhile(predicate: () => boolean): void };
 import { randomUUID } from 'node:crypto';
 import {
   AccessCodeRow, AttemptEventRow, AttemptRow, Branding, ExamSessionRow, ImportRow, MarkingRow,
@@ -25,17 +24,14 @@ import { DEFAULT_BRANDING, DEFAULT_ORG_SETTINGS, DEFAULT_SESSION_SETTINGS } from
 export { DEFAULT_BRANDING, DEFAULT_ORG_SETTINGS, DEFAULT_SESSION_SETTINGS };
 
 // Server only. Values the browser also needs live in ./defaults so importing
-// them never drags the SQLite driver into a client bundle.
+// them never drags the PostgreSQL driver into a client bundle.
 if (typeof window !== 'undefined') {
   throw new Error('src/lib/db.ts was imported from the browser. Import from src/lib/defaults.ts instead.');
 }
 
-const FILE = process.env.DATABASE_FILE || resolve(process.cwd(), 'data', 'examina.db');
+const DATABASE_URL = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/examina';
 
 const SCHEMA = `
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS organizations (
   id TEXT PRIMARY KEY,
   slug TEXT NOT NULL UNIQUE,
@@ -200,26 +196,72 @@ CREATE TABLE IF NOT EXISTS imports (
 );
 `;
 
-const globalForDb = globalThis as unknown as { __examinaDb?: DatabaseSync };
+const globalForDb = globalThis as unknown as { __examinaPool?: Pool; __examinaReady?: boolean };
 
-function open(): DatabaseSync {
-  if (globalForDb.__examinaDb) return globalForDb.__examinaDb;
-  mkdirSync(dirname(FILE), { recursive: true });
-  const db = new DatabaseSync(FILE);
-  db.exec(SCHEMA);
-  globalForDb.__examinaDb = db;
-  return db;
+function pool(): Pool {
+  if (!globalForDb.__examinaPool) {
+    globalForDb.__examinaPool = new Pool({
+      connectionString: DATABASE_URL,
+      connectionTimeoutMillis: Number(process.env.DATABASE_CONNECTION_TIMEOUT_MS ?? 5000),
+    });
+  }
+  return globalForDb.__examinaPool;
 }
 
-export const db = { get handle() { return open(); } };
+function open(): Pool {
+  if (!globalForDb.__examinaReady) {
+    awaitSync(pool().query(SCHEMA));
+    globalForDb.__examinaReady = true;
+  }
+  return pool();
+}
+
+export const db = { get pool() { return open(); } };
 
 const now = () => new Date().toISOString();
 const id = () => randomUUID();
 
-function all<T>(sql: string, ...p: unknown[]): T[] { return open().prepare(sql).all(...(p as never[])) as T[]; }
-function one<T>(sql: string, ...p: unknown[]): T | null { return (open().prepare(sql).get(...(p as never[])) as T) ?? null; }
-function run(sql: string, ...p: unknown[]) { return open().prepare(sql).run(...(p as never[])); }
-function count(sql: string, ...p: unknown[]): number { return one<{ n: number }>(sql, ...p)?.n ?? 0; }
+function pg(sql: string): string {
+  let i = 0;
+  return sql.replace(/\?/g, () => `$${++i}`);
+}
+
+function awaitSync<T>(promise: Promise<T>): T {
+  let done = false;
+  let result: T | undefined;
+  let error: unknown;
+  promise.then((value) => { result = value; }, (reason) => { error = reason; }).finally(() => { done = true; });
+  deasync.loopWhile(() => !done);
+  if (error) throw error;
+  return result as T;
+}
+
+function query<T extends QueryResultRow = QueryResultRow>(sql: string, ...p: unknown[]): QueryResult<T> {
+  return awaitSync(open().query<T>(pg(sql), p));
+}
+const CAMEL_KEYS: Record<string, string> = {
+  createdat: 'createdAt', updatedat: 'updatedAt', passwordhash: 'passwordHash',
+  candidateref: 'candidateRef', isplatformadmin: 'isPlatformAdmin', orgid: 'orgId',
+  userid: 'userId', testid: 'testId', sessionid: 'sessionId', accescode: 'accessCode',
+  accesscode: 'accessCode', opensat: 'opensAt', closesat: 'closesAt', durationmin: 'durationMin',
+  startedat: 'startedAt', endsat: 'endsAt', submittedat: 'submittedAt', rawscore: 'rawScore',
+  manualscore: 'manualScore', questionid: 'questionId', markerid: 'markerId', rubricid: 'rubricId',
+  maxuses: 'maxUses', usedcount: 'usedCount', expiresat: 'expiresAt', amountminor: 'amountMinor',
+  sizebytes: 'sizeBytes', mimetype: 'mimeType', extractedtext: 'extractedText',
+  orgslug: 'orgSlug', orgname: 'orgName', orgkind: 'orgKind', membershipid: 'membershipId',
+  testtitle: 'testTitle', testmodule: 'testModule', testcontent: 'testContent', testvariant: 'testVariant',
+  candidatename: 'candidateName', candidateemail: 'candidateEmail', sessionname: 'sessionName',
+  pricecredits: 'priceCredits'
+};
+
+function camelizeRow<T>(row: QueryResultRow): T {
+  return Object.fromEntries(Object.entries(row).map(([key, value]) => [CAMEL_KEYS[key] ?? key, value])) as T;
+}
+
+function all<T extends QueryResultRow = QueryResultRow>(sql: string, ...p: unknown[]): T[] { return query(sql, ...p).rows.map(camelizeRow<T>); }
+function one<T extends QueryResultRow = QueryResultRow>(sql: string, ...p: unknown[]): T | null { return all<T>(sql, ...p)[0] ?? null; }
+function run(sql: string, ...p: unknown[]) { return query(sql, ...p); }
+function count(sql: string, ...p: unknown[]): number { return Number(one<{ n: number }>(sql, ...p)?.n ?? 0); }
 
 /** Builds `SET a = ?, b = ?` from a patch object, skipping undefined values. */
 function setters(patch: Record<string, unknown>): { clause: string; values: unknown[] } {

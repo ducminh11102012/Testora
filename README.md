@@ -12,12 +12,11 @@ Thương hiệu, màu sắc và logo đều cấu hình được — không gắ
 
 ```bash
 npm install
-npm run seed      # tạo data/examina.db + tổ chức mẫu + tài khoản + đề mẫu
+npm run seed      # tạo schema PostgreSQL + tổ chức mẫu + tài khoản + đề mẫu
 npm run dev       # http://localhost:3000
 ```
 
-Yêu cầu **Node 22.5 trở lên** (dùng driver SQLite tích hợp sẵn của Node — không cài native
-module, không cần database server).
+Yêu cầu **Node 22.5 trở lên** và một PostgreSQL server. Cấu hình kết nối bằng `DATABASE_URL`.
 
 | Tài khoản | Mật khẩu | Vai trò |
 |---|---|---|
@@ -160,7 +159,7 @@ src/
     exam/          ExamShell, PassagePane, QuestionGroupView, BottomBar…
     admin/         TestEditor, ImportWizard, SessionManager, MarkingPanel, ReportsView…
   lib/
-    db.ts          toàn bộ SQL nằm ở đây (đổi sang Postgres là sửa một file)
+    db.ts          toàn bộ SQL PostgreSQL nằm ở đây
     auth.ts        session JWT trong cookie httpOnly + vai trò theo tổ chức
     grading.ts     chuẩn hoá đáp án + chấm
     brand.ts       token màu, áp bằng CSS variables
