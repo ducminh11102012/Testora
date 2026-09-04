@@ -1,0 +1,21 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "regions": [
+    "sin1"
+  ],
+  "functions": {
+    "src/app/api/admin/import/**": {
+      "maxDuration": 60
+    },
+    "src/app/api/attempts/**": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/maintenance/sweep",
+      "schedule": "0 3 * * *"
+    }
+  ]
+}
